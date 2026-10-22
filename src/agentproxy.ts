@@ -91,6 +91,15 @@ interface SourceState {
 	warnedPendingFull?: boolean;
 }
 
+/** The endpoint by host only: its path and query may carry the customer's credentials. */
+function endpointHost(url: string): string {
+	try {
+		return new URL(url).hostname;
+	} catch {
+		return '<invalid url>';
+	}
+}
+
 /** A message queued for the customer until its socket opens; control messages are never dropped, media is. */
 interface PendingEndpointMessage {
 	event: string;
@@ -477,7 +486,7 @@ export class AgentProxy extends Emitter {
 			this.endpointWs = endpointWs;
 
 			endpointWs.addEventListener('open', () => {
-				this.runtime.logger.info(`agent: connected to endpoint ${this.options.endpointUrl}`);
+				this.runtime.logger.info(`agent: connected to endpoint ${endpointHost(this.options.endpointUrl)}`);
 				this.endpointStatus = 'connected';
 				const queued = this.pendingEndpointMessages;
 				this.pendingEndpointMessages = [];

@@ -132,3 +132,15 @@ export function getTurnDetectionConfig() {
 	const { config } = require('./config');
 	return config.openai.turnDetection;
 }
+
+const CREDENTIAL_KEY = /authorization|token|secret|api-?key|cookie/i;
+
+/**
+ * A copy of a record (request headers, session parameters) with credential values masked, for debug logging: bearer
+ * tokens, shared secrets, API keys, cookies.
+ */
+export function redactCredentials(record: Record<string, unknown>): Record<string, unknown> {
+	return Object.fromEntries(
+		Object.entries(record).map(([key, value]) => [key, CREDENTIAL_KEY.test(key) && value !== undefined ? '[redacted]' : value]),
+	);
+}

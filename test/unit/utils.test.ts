@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractSessionParameters, validateTags } from '../../src/utils';
+import { extractSessionParameters, redactCredentials, validateTags } from '../../src/utils';
 
 describe('extractSessionParameters', () => {
 	describe('tag parameter', () => {
@@ -256,6 +256,47 @@ describe('extractSessionParameters', () => {
 
 			expect(params.url).toBeInstanceOf(URL);
 			expect(params.url.toString()).toBe(url);
+		});
+	});
+});
+
+describe('redactCredentials', () => {
+	it('masks credential headers and keeps the rest', () => {
+		expect(
+			redactCredentials({
+				host: 'proxy.example.com',
+				authorization: 'Bearer abc',
+				'x-agent-token': 'shared-secret',
+				'x-translation-token': 't',
+				'x-custom-openai-api-key': 'sk-1',
+				cookie: 'a=b',
+				'sec-websocket-key': 'k',
+				upgrade: 'websocket',
+			}),
+		).toEqual({
+			host: 'proxy.example.com',
+			authorization: '[redacted]',
+			'x-agent-token': '[redacted]',
+			'x-translation-token': '[redacted]',
+			'x-custom-openai-api-key': '[redacted]',
+			cookie: '[redacted]',
+			// A handshake nonce, not a credential.
+			'sec-websocket-key': 'k',
+			upgrade: 'websocket',
+		});
+	});
+
+	it('keeps an undefined value undefined', () => {
+		expect(redactCredentials({ authorization: undefined })).toEqual({ authorization: undefined });
+	});
+
+	it('masks the credential fields of session parameters, keeping the rest', () => {
+		expect(redactCredentials({ sessionId: 's1', provider: 'openai', openaiCustomApiKey: 'sk-1', agentToken: 't', url: 'ws://x/y' })).toEqual({
+			sessionId: 's1',
+			provider: 'openai',
+			openaiCustomApiKey: '[redacted]',
+			agentToken: '[redacted]',
+			url: 'ws://x/y',
 		});
 	});
 });

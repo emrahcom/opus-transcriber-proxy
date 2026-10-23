@@ -117,6 +117,42 @@ npm run cf:tail            # Tail logs
 
 The worker code is in `worker/` and uses `@cloudflare/containers` to run the Node.js server in a container.
 
+Four things to know about the Worker's use of the SDK:
+
+- **How it is really deployed, and which lockfile that uses.** Production, staging and dev are
+  deployed by the Jenkins job `deploy-cloudflare-opus-transcriber-proxy`, which runs
+  `cloudflare/opus-transcriber-proxy/deploy.sh` from `jitsi/infra-customizations-private`. That script
+  checks out this repo's **`main`**, runs `npm ci` at the **root**, and runs `wrangler deploy` from the
+  root with the wrapper `wrangler.jsonc` kept in that repo (its `main` points at `worker/index.ts`
+  here). `worker/node_modules` is never installed there, so the bundle resolves `@cloudflare/containers`
+  from the root `node_modules`: **the root lockfile is what production runs**, and the package must
+  stay installable by plain `npm ci` (it is a root devDependency; the server bundle never imports it).
+  `worker/package.json` + `worker/package-lock.json` apply only to this repo's own `cf:deploy` and
+  `wrangler dev`; keep the two pins at the same version. The wrapper config carries its own
+  `compatibility_date`/`compatibility_flags`, `containers` and `vars`, so a change to any of those in
+  this repo's `wrangler.jsonc` must be mirrored there to reach a deployment.
+- **WebSocket upgrades bypass the SDK's relay.** Since 0.2.1 the SDK's `Container.fetch()` accepts
+  the container's WebSocket inside the Durable Object and relays every message through a second
+  `WebSocketPair` in JS, renewing the activity timer per message. `TranscriberContainer` overrides
+  `fetch()` to return the container port's response directly for upgrades, as the SDK did before
+  0.2.1. The reasons, in order of weight: every 20 ms audio frame of every participant would run a
+  JS handler in the DO isolate (a 20-participant meeting is ~1000 messages/s on one single-threaded
+  object); the relay remaps a 1006 abnormal close from the container to a clean 1000, hiding a
+  container crash from the bridge and from our logs; and incoming frames would be billed as DO
+  requests, though at 20 messages per billable request that is a minor cost. The consequence is that
+  the SDK's activity timer never sees audio, so keeping a live call's container awake is done by the
+  Worker's renewal loop and the `/status` probe in `onActivityExpired`. Do not remove those on the
+  assumption that the SDK renews on WebSocket traffic.
+- **`ContainerProxy` is exported and `enable_ctx_exports` is on** although outbound interception is
+  not used: since 0.2 the SDK's Container constructor looks up `ctx.exports.ContainerProxy` whenever
+  the Durable Object is rebuilt around an already-running container, and logs an unhandled rejection
+  if either is missing. Keep both when touching `worker/index.ts` or `wrangler.jsonc`.
+- **Two SDK details the DO class depends on.** `TranscriberContainer.envVars` carries
+  `CONTAINER_INSTANCE_NAME` (from `ctx.id.name`) so every start path, including the SDK's
+  start-on-fetch, gives the container the same identity. And any `containerFetch` response body must
+  be consumed or cancelled: since 0.2.1 an unread body keeps the request counted as in flight, and
+  `isActivityExpired()` is false while anything is in flight, so the container would never sleep.
+
 ## Architecture
 
 ### Data Flow

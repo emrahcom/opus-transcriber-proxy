@@ -1,4 +1,10 @@
 import { Container, getContainer } from '@cloudflare/containers';
+
+// The SDK's outbound-interception entrypoint. Not used for interception here, but since 0.2 the
+// Container constructor looks it up via `ctx.exports.ContainerProxy` whenever the Durable Object is
+// rebuilt around an already-running container (a deploy, an isolate eviction) and logs an unhandled
+// rejection if it is missing; exporting it keeps those rebuilds quiet. Needs `enable_ctx_exports`.
+export { ContainerProxy } from '@cloudflare/containers';
 import type { Env } from './env';
 import { handleTranslate } from './handleTranslate';
 
@@ -37,9 +43,26 @@ interface TranscriptionMessage {
 }
 
 /**
- * Build the container env vars from the worker env bindings.
- * Shared between the class-level default and startAndWaitForPorts() override
- * (which adds CONTAINER_INSTANCE_NAME — not available at class init time).
+ * CONTAINER_INSTANCE_NAME for the container, from the name this Durable Object was looked up by.
+ * Every lookup in this Worker goes through `getContainer(binding, name)`, and Cloudflare keeps
+ * the name on the id when the object is later woken by one of its own alarms, so the name is
+ * expected to be set; the warning exists so that if an unnamed id ever appears (`idFromString`,
+ * `newUniqueId`, or an alarm scheduled before names were stored), the resulting change in
+ * `service.instance.id` and `info.instanceId` is explained in the log rather than silent.
+ */
+function instanceNameEnv(id: DurableObjectId): Record<string, string> {
+	if (!id.name) {
+		console.warn(`Durable Object ${id} has no name; CONTAINER_INSTANCE_NAME will be unset for its container`);
+		return {};
+	}
+	return { CONTAINER_INSTANCE_NAME: id.name };
+}
+
+/**
+ * Build the container env vars from the worker env bindings. `TranscriberContainer.envVars`
+ * adds CONTAINER_INSTANCE_NAME on top, so every start path (the Worker's explicit
+ * `startAndWaitForPorts`, the SDK's start-on-fetch, the passthrough override's safety net)
+ * gives the container the same identity.
  */
 function buildContainerEnvVars(env: Env): Record<string, string> {
 	return {
@@ -177,6 +200,32 @@ function buildWorkerInfo(request: Request, env: Env): Record<string, unknown> {
 }
 
 /**
+ * The platform error messages the SDK's `containerFetch` classifies a failed start by, copied from
+ * @cloudflare/containers 0.3.7 (`dist/lib/container.js`, `NO_CONTAINER_INSTANCE_ERROR` and
+ * `RATE_LIMITED_ERROR`; matched lower-cased by substring). The SDK does not export them, so
+ * re-check these two lines against the SDK source when bumping it.
+ */
+const SDK_NO_CONTAINER_INSTANCE_ERROR = 'there is no container instance that can be provided to this durable object';
+const SDK_RATE_LIMITED_ERROR = 'you are requesting too many containers per second';
+
+/**
+ * Turn a `startAndWaitForPorts()` failure into the response the SDK's `containerFetch` gives it:
+ * no instance available is a capacity condition (503), too many starts per second is rate
+ * limiting (429), anything else is a server error (500).
+ */
+function containerStartFailureResponse(e: unknown): Response {
+	const message = e instanceof Error ? e.message : String(e);
+	const lower = message.toLowerCase();
+	if (lower.includes(SDK_NO_CONTAINER_INSTANCE_ERROR)) {
+		return new Response('There is no Container instance available at this time.', { status: 503 });
+	}
+	if (lower.includes(SDK_RATE_LIMITED_ERROR)) {
+		return new Response(message, { status: 429 });
+	}
+	return new Response(`Failed to start container: ${message}`, { status: 500 });
+}
+
+/**
  * TranscriberContainer wraps the Node.js transcription server
  * and forwards WebSocket requests to it.
  */
@@ -196,8 +245,15 @@ export class TranscriberContainer extends Container<Env> {
 	// the container reclaims ~sleepAfter after the last renewal.
 	sleepAfter = this.env.SLEEP_AFTER || '7m';
 
-	// Pass environment variables to the container (default, without instance name)
-	envVars: Record<string, string> = buildContainerEnvVars(this.env);
+	// Environment for the container. The instance name is the name this Durable Object was
+	// looked up by (`getContainer(binding, name)` → `idFromName`), which is the session or pool
+	// slot id the Worker uses everywhere else. The Worker's explicit start passes the same env
+	// again with the name it routed by, so a start from a request never depends on `ctx.id.name`;
+	// this default covers the SDK's start-on-fetch and the passthrough override's safety net.
+	envVars: Record<string, string> = {
+		...buildContainerEnvVars(this.env),
+		...instanceNameEnv(this.ctx.id),
+	};
 
 	override onStart() {
 		console.log('Transcriber container started');
@@ -220,11 +276,85 @@ export class TranscriberContainer extends Container<Env> {
 	}
 
 	/**
+	 * Hand WebSocket upgrades straight to the container instead of letting the SDK proxy them.
+	 *
+	 * Since @cloudflare/containers 0.2.1, `Container.fetch()` (via `containerFetch`) no longer
+	 * returns the container's WebSocket to the caller: it accepts it inside this Durable
+	 * Object, creates a second WebSocketPair, and relays every message between the two in JS,
+	 * calling `renewActivityTimeout()` per message. For this workload that would run a JS
+	 * handler in this DO's isolate for every 20 ms audio frame of every participant (a
+	 * 20-participant meeting is ~1000 messages/s on one single-threaded object), add a hop of
+	 * latency, and remap a 1006 abnormal close from the container to a clean 1000, hiding a
+	 * container crash from the bridge and from our logs; the incoming frames would also be
+	 * billed as DO requests, a minor cost at 20 messages per billable request. The pre-0.2.1
+	 * behaviour (what this deployment ran on, at 0.0.31, before this upgrade) was a plain
+	 * passthrough: the response from the container's TCP port is returned as-is and workerd
+	 * pipes the socket with no per-message code here. This override restores that for upgrades
+	 * only; plain HTTP (the /status probe in `onActivityExpired`, anything else) still goes
+	 * through the SDK.
+	 *
+	 * Consequence: the SDK's activity timer does not see WebSocket traffic, exactly as before,
+	 * so keeping a live call's container awake stays our job (the renewal loop in
+	 * `handleWebSocketWithDispatcher` and the `/status` probe in `onActivityExpired` below).
+	 *
+	 * The Worker always calls `startAndWaitForPorts()` before `fetch()`, so the start here is
+	 * only a safety net for a container that stopped in between. It is gated the way
+	 * `containerFetch` gates its own start, on the container not running or the SDK's persisted
+	 * state not being healthy (`getState()` is a cached storage read), so an upgrade that lands
+	 * while a restart is between `start()` and the port coming up joins that start instead of
+	 * failing against a port that is not listening yet. Calling `startAndWaitForPorts()`
+	 * unconditionally would instead cost a port probe, a storage write and an `onStart` per
+	 * upgrade.
+	 *
+	 * Failures are returned as responses, not thrown, with the status `containerFetch` would
+	 * give them (503 when no container instance is available, 429 when rate limited, 500
+	 * otherwise), so the Worker's `status !== 101` handling and its log lines are unchanged.
+	 *
+	 * The body below mirrors `containerFetch` in @cloudflare/containers 0.3.7 (URL rewrite,
+	 * port lookup, error texts). None of that is covered by the SDK's types, so re-read
+	 * `containerFetch` when bumping the SDK.
+	 */
+	override async fetch(request: Request): Promise<Response> {
+		if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+			return super.fetch(request);
+		}
+		const port = this.defaultPort;
+		const container = this.ctx.container;
+		if (!container) {
+			return new Response('Durable Object has no container binding', { status: 500 });
+		}
+		if (!container.running || (await this.getState()).status !== 'healthy') {
+			// Every other start is logged by the Worker; this one would otherwise be invisible, and a
+			// container that dies between the Worker's start and the upgrade is exactly what to notice.
+			console.warn(`Container ${this.ctx.id.name ?? this.ctx.id} not ready at upgrade (running=${container.running}); starting it before connecting`);
+			try {
+				await this.startAndWaitForPorts({ ports: port, cancellationOptions: { abort: request.signal } });
+			} catch (e) {
+				return containerStartFailureResponse(e);
+			}
+		}
+		this.renewActivityTimeout();
+		try {
+			// The container's port speaks plain HTTP (the SDK rewrites the scheme the same way).
+			return await container.getTcpPort(port).fetch(request.url.replace(/^https:/, 'http:'), request);
+		} catch (e) {
+			if (!(e instanceof Error)) {
+				throw e;
+			}
+			if (e.message.includes('Network connection lost.')) {
+				return new Response('Container suddenly disconnected, try again', { status: 500 });
+			}
+			console.error(`Error proxying WebSocket upgrade to container ${this.ctx.id}:`, e);
+			return new Response(`Error proxying request to container: ${e.message}`, { status: 500 });
+		}
+	}
+
+	/**
 	 * Called when the activity timer (`sleepAfter`) elapses. The default stops the
-	 * container. WebSocket audio frames bypass the Container class, so the timer never
-	 * sees an in-progress call and would sleep it mid-session — on EVERY routing path,
-	 * including the direct `container.fetch` path used by `useDispatcher=false` (VCC)
-	 * connections, which has no Worker-side renewal loop.
+	 * container. WebSocket audio frames bypass the SDK's activity tracking (see the `fetch`
+	 * override above), so the timer never sees an in-progress call and would sleep it
+	 * mid-session — on EVERY routing path, including the direct `container.fetch` path used by
+	 * `useDispatcher=false` (VCC) connections, which has no Worker-side renewal loop.
 	 *
 	 * So before sleeping, ask the container whether any sessions are still live; if so,
 	 * keep it alive. This is path-agnostic (it's the DO's own lifecycle hook) and costs
@@ -237,7 +367,7 @@ export class TranscriberContainer extends Container<Env> {
 	 */
 	override async onActivityExpired(): Promise<void> {
 		try {
-			const res = await this.containerFetch('http://container/status', 8080);
+			const res = await this.containerFetch('http://container/status', this.defaultPort);
 			if (res.ok) {
 				const { active = 0, detached = 0 } = (await res.json()) as { active?: number; detached?: number };
 				if (active + detached > 0) {
@@ -253,6 +383,11 @@ export class TranscriberContainer extends Container<Env> {
 				// Non-2xx from /status: can't trust session state, so allow the default stop —
 				// but log it, otherwise a recurring 4xx/5xx that sleeps live calls is invisible.
 				console.error(`onActivityExpired: /status returned ${res.status}, allowing container to sleep`);
+				// Drain the body. Since SDK 0.2.1 `containerFetch` counts a request as in flight
+				// until its body is consumed, and `isActivityExpired()` is permanently false while
+				// anything is in flight — an unread error body here would keep this DO's next
+				// container alive until the isolate is evicted.
+				await res.text().catch(() => undefined);
 			}
 		} catch (error) {
 			// Can't determine session state — fall through to the default stop. If the
@@ -459,8 +594,9 @@ async function handleWebSocketWithDispatcher(
 	}
 
 	// Keep the container alive for the life of the call by renewing its activity timeout.
-	// WebSocket audio frames bypass the Container class, so sleepAfter does NOT reset on
-	// its own — without this the container sleeps (SIGTERM) ~sleepAfter after start, mid-call.
+	// WebSocket audio frames bypass the SDK's activity tracking (TranscriberContainer.fetch
+	// passes upgrades straight through), so sleepAfter does NOT reset on its own — without
+	// this the container sleeps (SIGTERM) ~sleepAfter after start, mid-call.
 	// renewActivityTimeout() is the real Container method (there is no keepAlive()); each
 	// call is one Worker subrequest, so we renew infrequently (every 3m) to stay well under
 	// the 1000-subrequest-per-invocation limit on long sessions. The interval must stay
@@ -701,6 +837,9 @@ export default {
 		// This is required for the fetch to work properly
 		try {
 			await container.startAndWaitForPorts({
+				// The class-level envVars already carry the instance name from ctx.id.name; passing it
+				// explicitly with the name the Worker routed by keeps a request-driven start independent
+				// of whether the Durable Object's id arrived with its name.
 				startOptions: {
 					envVars: { ...buildContainerEnvVars(env), CONTAINER_INSTANCE_NAME: containerInstanceId },
 				},
@@ -724,8 +863,10 @@ export default {
 
 		// Report connection tracking for autoscale mode
 		const routingMode = env.ROUTING_MODE || 'session';
-		const upgradeHeader = request.headers.get('Upgrade');
-		if (routingMode === 'autoscale' && upgradeHeader === 'websocket') {
+		// Header values are case-insensitive (RFC 6455 clients send both `websocket` and `WebSocket`);
+		// the same normalised test is used by TranscriberContainer.fetch, so both layers agree.
+		const isWebSocketUpgrade = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+		if (routingMode === 'autoscale' && isWebSocketUpgrade) {
 			const coordinator = env.CONTAINER_COORDINATOR.get(env.CONTAINER_COORDINATOR.idFromName('global'));
 
 			// Report connection opened
@@ -745,7 +886,7 @@ export default {
 		}
 
 		// If dispatcher is enabled and this is a WebSocket upgrade, intercept the connection
-		if (useDispatcher && upgradeHeader === 'websocket' && env.DISPATCHER_DO) {
+		if (useDispatcher && isWebSocketUpgrade && env.DISPATCHER_DO) {
 			return handleWebSocketWithDispatcher(request, container, env, ctx, sessionId);
 		}
 
@@ -759,9 +900,8 @@ export default {
 			console.error(`Container fetch failed: ${errorMsg}${errorStack ? '\n' + errorStack : ''}`);
 
 			// Return appropriate error response
-			const isWebSocket = upgradeHeader === 'websocket';
 			return new Response(
-				isWebSocket
+				isWebSocketUpgrade
 					? `WebSocket Upgrade Failed: Container unreachable (${errorMsg})`
 					: `Service Unavailable: Container connection failed (${errorMsg})`,
 				{

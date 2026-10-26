@@ -32,9 +32,9 @@
  * worse; a container that crashed or never listened (the SDK surfaces that as the port probe's own
  * error); and anything unrecognised, since an unknown failure is not known to be transient. The
  * waits add about a second (250 + 750 ms, jittered) on top of the attempts themselves, each of which
- * can take as long as the port wait, and no retry starts once 5 s have passed since the first
- * attempt: small on purpose, since audio is buffering behind the upgrade and the bridge redials on
- * its own soon after.
+ * can take as long as the port wait, and no retry starts whose wait would end more than 5 s after
+ * the first attempt began: small on purpose, since audio is buffering behind the upgrade and the
+ * bridge redials on its own soon after.
  */
 
 /** Fallback for errors without the stub flags: messages the platform used for failures that cleared. */
@@ -118,10 +118,13 @@ export async function startWithRetries<T>(start: () => Promise<T>, options: Star
 			return await start();
 		} catch (error) {
 			const base = delays[attempt - 1];
-			if (base === undefined || !isTransientStartFailure(error) || now() + base > deadline) {
+			if (base === undefined || !isTransientStartFailure(error)) {
 				throw error;
 			}
 			const delay = Math.round(base * (1 - jitter + 2 * jitter * random()));
+			if (now() + delay > deadline) {
+				throw error;
+			}
 			options.onRetry?.(attempt, error, delay);
 			await sleep(delay);
 		}

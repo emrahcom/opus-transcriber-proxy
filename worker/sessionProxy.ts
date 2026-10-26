@@ -20,6 +20,7 @@ import type { DispatcherTranscriptionMessage, TranscriptionMessage } from './typ
 import { buildWorkerInfo } from './containerEnv';
 import { closeReason } from '../src/agent/closeReason';
 import { DISPATCHER_QUEUE_LIMIT } from './dispatcherForwarder';
+import { containerFailureReason, containerUnreachablePoints, countLater, requestColo } from './metrics';
 
 /**
  * A close code workerd will put in a close frame: 1000-1003, 1007-1014 and 3000-4999. Its `close()`
@@ -58,6 +59,7 @@ export async function handleWebSocketWithDispatcher(
 	serverWs.accept();
 
 	// Forward the upgrade request to the container
+	const colo = requestColo(request);
 	let containerResponse: Response;
 	try {
 		containerResponse = await container.fetch(request);
@@ -65,6 +67,7 @@ export async function handleWebSocketWithDispatcher(
 		// Container connection failed - close client WebSocket with error
 		const errorMsg = error instanceof Error ? error.message : 'Container connection failed';
 		console.error(`Container fetch failed during WebSocket upgrade: ${errorMsg}`);
+		countLater(ctx, env, () => containerUnreachablePoints('dispatcher', 'stub_failed', colo));
 		serverWs.close(1011, closeReason(`Container unreachable: ${errorMsg}`));
 		return new Response('Service Unavailable: Container connection failed', {
 			status: 503,
@@ -74,6 +77,8 @@ export async function handleWebSocketWithDispatcher(
 
 	if (containerResponse.status !== 101 || !containerResponse.webSocket) {
 		// Container didn't upgrade - return error to client
+		const failure = containerFailureReason(containerResponse);
+		if (failure) countLater(ctx, env, () => containerUnreachablePoints('dispatcher', failure, colo));
 		serverWs.close(1011, 'Container failed to upgrade WebSocket');
 		return containerResponse;
 	}

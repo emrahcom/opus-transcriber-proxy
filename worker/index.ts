@@ -21,7 +21,8 @@ import { TranscriberContainer } from './TranscriberContainer';
 import { buildContainerEnvVars } from './containerEnv';
 import { selectContainerInstance } from './routing';
 import { handleWebSocketWithDispatcher } from './sessionProxy';
-import { startContainer } from './startRetry';
+import { startContainer, startResult } from './startRetry';
+import { containerFailureReason, containerStartPoints, containerUnreachablePoints, countLater, requestColo } from './metrics';
 
 // wrangler resolves Durable Object classes from the entry module; the message types are
 // re-exported so the entry module stays the Worker's public surface.
@@ -79,6 +80,15 @@ export default {
 		// a second of waits in between, before the bridge is told to come back.
 		const startedAt = Date.now();
 		let attempts = 0;
+		const colo = requestColo(request);
+		// Header values are case-insensitive (RFC 6455 clients send both `websocket` and `WebSocket`);
+		// the same normalised test is used by TranscriberContainer.fetch, so both layers agree.
+		const isWebSocketUpgrade = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
+		// Only upgrades are counted: they are the sessions, and a health check is not a start.
+		// Called once the start has finished, so `attempts` is final.
+		const countStart = (failure?: { error: unknown }) => {
+			if (isWebSocketUpgrade) countLater(ctx, env, () => containerStartPoints(startResult(attempts, failure), attempts, colo));
+		};
 		let container: DurableObjectStub<TranscriberContainer>;
 		try {
 			container = await startContainer(
@@ -110,6 +120,7 @@ export default {
 			const errorMsg = error instanceof Error ? error.message : 'Container failed to start';
 			const errorStack = error instanceof Error ? error.stack : undefined;
 			console.error(`Container failed to start after ${attempts} attempt(s) in ${Date.now() - startedAt}ms: ${errorMsg}, container=${containerInstanceId}${errorStack ? '\n' + errorStack : ''}`);
+			countStart({ error });
 			return new Response(`Service Unavailable: Container failed to start (${errorMsg})`, {
 				status: 503,
 				statusText: 'Container Start Failed',
@@ -118,12 +129,10 @@ export default {
 				},
 			});
 		}
+		countStart();
 
 		// Report connection tracking for autoscale mode
 		const routingMode = env.ROUTING_MODE || 'session';
-		// Header values are case-insensitive (RFC 6455 clients send both `websocket` and `WebSocket`);
-		// the same normalised test is used by TranscriberContainer.fetch, so both layers agree.
-		const isWebSocketUpgrade = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 		if (routingMode === 'autoscale' && isWebSocketUpgrade) {
 			const coordinator = env.CONTAINER_COORDINATOR.get(env.CONTAINER_COORDINATOR.idFromName('global'));
 
@@ -150,8 +159,12 @@ export default {
 
 		// Forward request directly to container (pass-through mode)
 		try {
-			return await container.fetch(request);
+			const response = await container.fetch(request);
+			const failure = isWebSocketUpgrade ? containerFailureReason(response) : undefined;
+			if (failure) countLater(ctx, env, () => containerUnreachablePoints('direct', failure, colo));
+			return response;
 		} catch (error) {
+			if (isWebSocketUpgrade) countLater(ctx, env, () => containerUnreachablePoints('direct', 'stub_failed', colo));
 			// Container connection failed
 			const errorMsg = error instanceof Error ? error.message : 'Container connection failed';
 			const errorStack = error instanceof Error ? error.stack : undefined;

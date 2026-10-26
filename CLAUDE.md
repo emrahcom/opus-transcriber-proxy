@@ -162,10 +162,40 @@ Five things to know about the Worker's use of the SDK:
   attempt(s) in Xms: <error>, container=<id>"). So each rescued start is exactly one ready line with
   N > 1 (count those, not the retry warnings, of which a rescue writes N - 1), and each 503 for a start
   failure is one failed-to-start line (the Worker also answers 503 when the container cannot be
-  reached after a successful start, which these lines do not cover). The ready line is written on
+  reached after a successful start, which these lines do not cover, but the unreachable counter
+  below does). The ready line is written on
   every request, including those that find the container already running, so its elapsed time
-  mixes cold starts with near-instant checks. The Worker has no metrics pipeline, so alerting on
-  these is done from the logs.
+  mixes cold starts with near-instant checks. Each start is also counted, from the Worker itself
+  (`worker/metrics.ts`): `otp_worker_container_starts{result, colo}` (`result` = `ok`, `rescued`,
+  `gave_up` for a failure after retrying or a transient one with no retry left, `failed` for one
+  the retry never touched; `ok` includes the warm-container checks) and
+  `otp_worker_container_start_retries{colo}`, the retries the start took. Every push carries a zero
+  for the other results and the retries: the collector makes a stream's first delta its first
+  running total, which `rate()` cannot count, and forgets a stream idle for a day, so a rare
+  failure would otherwise usually be invisible; the frequent `ok` pushes keep each colo's streams
+  alive at zero. The limit: in a colo with no starts for a day, the first failure after the gap is
+  still unseen (its push recreates the streams, so later ones count). Only WebSocket upgrades are
+  counted (they are the sessions; a health check is not a start). A container that started but
+  could not then take the upgrade is counted separately, as `otp_worker_container_unreachable{path,
+  reason, colo}`: `path` = `direct` or `dispatcher`; `reason` = `stub_failed` when the call to the
+  Durable Object threw, or the reason `TranscriberContainer.fetch` marks its own failure responses
+  with in `X-Container-Failure` (`start_failed` when it had to start the container again and could
+  not, `disconnected` when the port could not be reached). The container server's own refusals,
+  such as an `/agent` upgrade answered 400 or 503, carry no mark and are not counted. Its series are
+  kept alive at zero by the start pushes; those requests count as `ok` starts too. Metric code goes
+  through `countLater`, which cannot throw into the request. They are OTLP
+  **delta** counters, pushed one POST per start (and per unreachable container) inside
+  `ctx.waitUntil` with the `OTLP_*` settings the Worker forwards to the container, and hand-built
+  because the OpenTelemetry SDK does not run in a Worker. Every isolate sends the same series, with no instance identity: isolates are
+  short-lived, and a series per isolate would lose each one's first count, which `rate()` cannot
+  see. The collector (`nomad/alloy-cloudflare.hcl` in infra-customizations-private) restamps delta
+  points with their arrival time so concurrent pushes stay in order, converts them to running
+  totals per replica, and tags each replica `collector_replica`; it stores them as `..._total`. So a
+  query **sums** across replicas (`sum by (result) (rate(otp_worker_container_starts_total[5m]))`),
+  unlike the container's cumulative `otp_*` counters, which take the max. The payload sets
+  `cloudflare.source` to `cloudflare-workers` over the deployment's `OTLP_RESOURCE_ATTRIBUTES`
+  (which names the container). With no `OTLP_ENDPOINT` nothing is pushed; a failed push (a missing
+  token answers 401) only logs `Metrics push failed`. Alert rules on them do not live in this repo.
 - **Two SDK details the DO class depends on.** `TranscriberContainer.envVars` carries
   `CONTAINER_INSTANCE_NAME` (from `ctx.id.name`) so every start path, including the SDK's
   start-on-fetch, gives the container the same identity. And any `containerFetch` response body must
@@ -501,10 +531,11 @@ See README.md for complete configuration reference.
 
 The `worker/` directory contains:
 - `index.ts` - Cloudflare Worker entry point: the fetch router, plus the Durable Object class re-exports wrangler needs
-- `TranscriberContainer.ts` - the container Durable Object (passthrough `fetch` override, `/status` idle probe)
+- `TranscriberContainer.ts` - the container Durable Object (passthrough `fetch` override, which marks its own failure responses with `X-Container-Failure`; `/status` idle probe)
 - `routing.ts` - `selectContainerInstance` (session / pool / shared / autoscale)
 - `sessionProxy.ts` - `handleWebSocketWithDispatcher`: the client<->container pipe with dispatcher forwarding and the keepalive loop. Every socket it holds (client, container, Dispatcher DO) gets a reply to a received close frame, since our compatibility date has no automatic reply; a close from a dispatcher socket that has already been replaced does not start another reconnect
 - `containerEnv.ts` - container env vars, instance name, the `worker` info block
+- `startRetry.ts` / `metrics.ts` - the container start retry, and the OTLP counters the Worker pushes for each start
 - `ContainerCoordinator.ts` - Manages container routing (pool vs session mode)
 - `handleTranslate.ts` - Worker-hosted `/translate` (no container; see Translation runtime abstraction)
 - `translationRuntime.ts` / `outboundWebSocket.ts` / `opusWasmSource.ts` - the Worker `TranslationRuntime`
@@ -625,6 +656,7 @@ worker/
 ├── containerEnv.ts            # Container env vars, instance name, `worker` info block (pure functions)
 ├── routing.ts                 # selectContainerInstance (session / pool / shared / autoscale)
 ├── startRetry.ts              # Retry a container start that failed for a transient platform reason
+├── metrics.ts                 # OTLP/HTTP delta counters pushed from the Worker (container start outcomes)
 ├── sessionProxy.ts            # handleWebSocketWithDispatcher: client<->container pipe, dispatcher queue, keepalive
 ├── types.ts                   # Dispatcher / transcription message shapes
 ├── ContainerCoordinator.ts    # Container routing logic
@@ -639,7 +671,7 @@ scripts/check-license-headers.mjs  # CI guard: every source file carries the cop
 
 test/
 ├── setup.ts                   # Vitest setup
-├── unit/worker/               # Worker module tests (containerEnv, routing, TranscriberContainer, sessionProxy)
+├── unit/worker/               # Worker module tests (containerEnv, routing, TranscriberContainer, sessionProxy, startRetry, metrics)
 ├── helpers/                   # Test utilities
 └── unit/                      # Unit tests
 ```

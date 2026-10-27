@@ -533,11 +533,13 @@ The `worker/` directory contains:
 - `index.ts` - Cloudflare Worker entry point: the fetch router, plus the Durable Object class re-exports wrangler needs
 - `TranscriberContainer.ts` - the container Durable Object (passthrough `fetch` override, which marks its own failure responses with `X-Container-Failure`; `/status` idle probe)
 - `routing.ts` - `selectContainerInstance` (session / pool / shared / autoscale)
-- `sessionProxy.ts` - `handleWebSocketWithDispatcher`: the client<->container pipe with dispatcher forwarding and the keepalive loop. Every socket it holds (client, container, Dispatcher DO) gets a reply to a received close frame, since our compatibility date has no automatic reply; a close from a dispatcher socket that has already been replaced does not start another reconnect
+- `sessionProxy.ts` - `handleWebSocketWithDispatcher`: the client<->container pipe with dispatcher forwarding and the keepalive loop. Every socket it holds (client, container, Dispatcher DO) gets a reply to a received close frame, since our compatibility date has no automatic reply; a close from a dispatcher socket that has already been replaced does not start another reconnect. A socket left CLOSING is not free: workerd runs every accepted socket's read loop as a `waitUntil` task, so one whose peer never replies is cancelled 30 s after the invocation ends with the "waitUntil() tasks did not complete" warning — that warning once per session means a peer (the Dispatcher DO is the candidate) is not answering our close. The dispatcher socket's close is logged at `info` only when it is the DO's 1000 reply to a close we sent (`dispatcherCloseSent`); every other close is an `error` (mid-session the DO dropping us, which the backoff reconnect recovers from; after our close a DO that vanished instead of replying). A dispatcher socket dialled after the session ended (the flush-on-close reconnect) gets no listeners, so its close is not logged at all. `closeCode.ts` holds `sendableCloseCode`, shared with `dispatcherForwarder.ts`, the `/translate` path's dispatcher socket, which replies to a received close frame the same way
 - `containerEnv.ts` - container env vars, instance name, the `worker` info block
 - `startRetry.ts` / `metrics.ts` - the container start retry, and the OTLP counters the Worker pushes for each start
 - `ContainerCoordinator.ts` - Manages container routing (pool vs session mode)
 - `handleTranslate.ts` - Worker-hosted `/translate` (no container; see Translation runtime abstraction)
+- `dispatcherForwarder.ts` - the `/translate` path's Dispatcher DO socket: bounded queue while (re)connecting, reopened on the next forward, replies to a received close frame
+- `closeCode.ts` - `sendableCloseCode`, the close codes workerd will put in a close frame, shared by `sessionProxy.ts` and `dispatcherForwarder.ts`
 - `translationRuntime.ts` / `outboundWebSocket.ts` / `opusWasmSource.ts` - the Worker `TranslationRuntime`
 - Uses `@cloudflare/containers` to run the Node.js server for `/transcribe`
 
@@ -658,9 +660,11 @@ worker/
 ├── startRetry.ts              # Retry a container start that failed for a transient platform reason
 ├── metrics.ts                 # OTLP/HTTP delta counters pushed from the Worker (container start outcomes)
 ├── sessionProxy.ts            # handleWebSocketWithDispatcher: client<->container pipe, dispatcher queue, keepalive
+├── closeCode.ts               # sendableCloseCode: the close codes workerd can put in a close frame
 ├── types.ts                   # Dispatcher / transcription message shapes
 ├── ContainerCoordinator.ts    # Container routing logic
 ├── handleTranslate.ts         # Worker-hosted /translate (WebSocketPair + TranslatorProxy)
+├── dispatcherForwarder.ts     # /translate's Dispatcher DO socket (bounded queue, reconnect on next forward)
 ├── translationRuntime.ts      # Worker TranslationRuntime (WASM codec, fetch-upgrade, info)
 ├── outboundWebSocket.ts       # Fetch-upgrade outbound WebSocket wrapped as IWebSocket
 ├── opusWasmSource.ts          # Import-loaded WASM binding for the Worker
@@ -671,7 +675,7 @@ scripts/check-license-headers.mjs  # CI guard: every source file carries the cop
 
 test/
 ├── setup.ts                   # Vitest setup
-├── unit/worker/               # Worker module tests (containerEnv, routing, TranscriberContainer, sessionProxy, startRetry, metrics)
+├── unit/worker/               # Worker module tests (containerEnv, routing, TranscriberContainer, sessionProxy, dispatcherForwarder, startRetry, metrics)
 ├── helpers/                   # Test utilities
 └── unit/                      # Unit tests
 ```

@@ -23,6 +23,7 @@ import { selectContainerInstance } from './routing';
 import { handleWebSocketWithDispatcher } from './sessionProxy';
 import { startContainer, startResult } from './startRetry';
 import { containerFailureReason, containerStartPoints, containerUnreachablePoints, countLater, requestColo } from './metrics';
+import { applyProviderOverride, describeOverrideDecision, resolveProviderOverride, type OverridableProvider } from './providerOverride';
 
 // wrangler resolves Durable Object classes from the entry module; the message types are
 // re-exported so the entry module stays the Worker's public surface.
@@ -37,7 +38,12 @@ export { ContainerCoordinator } from './ContainerCoordinator';
 
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
-		const url = new URL(request.url);
+		let url = new URL(request.url);
+
+		// Header values are case-insensitive (RFC 6455 clients send both `websocket` and `WebSocket`);
+		// the same normalised test is used by TranscriberContainer.fetch, so both layers agree.
+		// Computed here rather than further down because the provider-override gate below needs it.
+		const isWebSocketUpgrade = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 
 		// Handle /translate entirely in this Worker (no container). The accepted WebSocket keeps the
 		// Worker alive for the session; the bridge's pings keep it active. Transcribe stays on the
@@ -64,6 +70,35 @@ export default {
 			}
 		}
 
+		// Apply the operator provider override, if one is armed in KV and this request did not name a
+		// provider itself. Done before the container is selected so it covers BOTH forwarding paths
+		// below (dispatcher and direct) — each of them forwards this request object as-is, and the
+		// container reads `provider` from the URL already, so nothing container-side changes.
+		//
+		// Every failure mode inside resolveProviderOverride degrades to "not applied", so a bad or
+		// unreachable override can only leave the configured default in place.
+		// Gated to transcribe upgrades: every other request reaching this point (/health and /status
+		// probes, /agent upgrades, plain GETs) is forwarded to the container unchanged. Without the
+		// gate each of them pays a KV read, a malformed entry logs once per probe instead of once per
+		// session, and an /agent upgrade is forwarded with a `provider` parameter it has no use for.
+		const overrideDecision = isWebSocketUpgrade && url.pathname.endsWith('/transcribe')
+			? await resolveProviderOverride(request, env)
+			: ({ applied: false, level: 'debug', why: 'not a transcribe upgrade' } as const);
+		let providerOverride: OverridableProvider | undefined;
+		if (overrideDecision.applied) {
+			providerOverride = overrideDecision.provider;
+			request = applyProviderOverride(request, overrideDecision.provider);
+			// Re-derive rather than patching `url` separately, so the rewritten request stays the one
+			// definition of this connection's parameters.
+			url = new URL(request.url);
+			console.log(describeOverrideDecision(overrideDecision));
+		} else if (overrideDecision.level === 'error') {
+			// A malformed or unusable override is an operator mistake that is silently doing nothing.
+			console.error(describeOverrideDecision(overrideDecision));
+		} else if (overrideDecision.level === 'info') {
+			console.log(describeOverrideDecision(overrideDecision));
+		}
+
 		// Check query param first, fall back to env var
 		const useDispatcherParam = url.searchParams.get('useDispatcher');
 		const useDispatcher = useDispatcherParam !== null
@@ -81,9 +116,6 @@ export default {
 		const startedAt = Date.now();
 		let attempts = 0;
 		const colo = requestColo(request);
-		// Header values are case-insensitive (RFC 6455 clients send both `websocket` and `WebSocket`);
-		// the same normalised test is used by TranscriberContainer.fetch, so both layers agree.
-		const isWebSocketUpgrade = request.headers.get('Upgrade')?.toLowerCase() === 'websocket';
 		// Only upgrades are counted: they are the sessions, and a health check is not a start.
 		// Called once the start has finished, so `attempts` is final.
 		const countStart = (failure?: { error: unknown }) => {
@@ -154,7 +186,7 @@ export default {
 
 		// If dispatcher is enabled and this is a WebSocket upgrade, intercept the connection
 		if (useDispatcher && isWebSocketUpgrade && env.DISPATCHER_DO) {
-			return handleWebSocketWithDispatcher(request, container, env, ctx, sessionId);
+			return handleWebSocketWithDispatcher(request, container, env, ctx, sessionId, providerOverride);
 		}
 
 		// Forward request directly to container (pass-through mode)
